@@ -9,116 +9,502 @@
 package mysql
 
 import (
-	"fmt"
+	"bytes"
+	"database/sql"
+	"database/sql/driver"
+	"encoding/binary"
 	"testing"
 	"time"
 )
 
-var testDSNs = []struct {
-	in  string
-	out string
-	loc *time.Location
-}{
-	{"username:password@protocol(address)/dbname?param=value", "&{user:username passwd:password net:protocol addr:address dbname:dbname params:map[param:value] loc:%p timeout:0 tls:<nil> allowAllFiles:false allowOldPasswords:false clientFoundRows:false}", time.UTC},
-	{"user@unix(/path/to/socket)/dbname?charset=utf8", "&{user:user passwd: net:unix addr:/path/to/socket dbname:dbname params:map[charset:utf8] loc:%p timeout:0 tls:<nil> allowAllFiles:false allowOldPasswords:false clientFoundRows:false}", time.UTC},
-	{"user:password@tcp(localhost:5555)/dbname?charset=utf8&tls=true", "&{user:user passwd:password net:tcp addr:localhost:5555 dbname:dbname params:map[charset:utf8] loc:%p timeout:0 tls:<nil> allowAllFiles:false allowOldPasswords:false clientFoundRows:false}", time.UTC},
-	{"user:password@tcp(localhost:5555)/dbname?charset=utf8mb4,utf8&tls=skip-verify", "&{user:user passwd:password net:tcp addr:localhost:5555 dbname:dbname params:map[charset:utf8mb4,utf8] loc:%p timeout:0 tls:<nil> allowAllFiles:false allowOldPasswords:false clientFoundRows:false}", time.UTC},
-	{"user:password@/dbname?loc=UTC&timeout=30s&allowAllFiles=1&clientFoundRows=true&allowOldPasswords=TRUE", "&{user:user passwd:password net:tcp addr:127.0.0.1:3306 dbname:dbname params:map[] loc:%p timeout:30000000000 tls:<nil> allowAllFiles:true allowOldPasswords:true clientFoundRows:true}", time.UTC},
-	{"user:p@ss(word)@tcp([de:ad:be:ef::ca:fe]:80)/dbname?loc=Local", "&{user:user passwd:p@ss(word) net:tcp addr:[de:ad:be:ef::ca:fe]:80 dbname:dbname params:map[] loc:%p timeout:0 tls:<nil> allowAllFiles:false allowOldPasswords:false clientFoundRows:false}", time.Local},
-	{"/dbname", "&{user: passwd: net:tcp addr:127.0.0.1:3306 dbname:dbname params:map[] loc:%p timeout:0 tls:<nil> allowAllFiles:false allowOldPasswords:false clientFoundRows:false}", time.UTC},
-	{"@/", "&{user: passwd: net:tcp addr:127.0.0.1:3306 dbname: params:map[] loc:%p timeout:0 tls:<nil> allowAllFiles:false allowOldPasswords:false clientFoundRows:false}", time.UTC},
-	{"/", "&{user: passwd: net:tcp addr:127.0.0.1:3306 dbname: params:map[] loc:%p timeout:0 tls:<nil> allowAllFiles:false allowOldPasswords:false clientFoundRows:false}", time.UTC},
-	{"", "&{user: passwd: net:tcp addr:127.0.0.1:3306 dbname: params:map[] loc:%p timeout:0 tls:<nil> allowAllFiles:false allowOldPasswords:false clientFoundRows:false}", time.UTC},
-	{"user:p@/ssword@/", "&{user:user passwd:p@/ssword net:tcp addr:127.0.0.1:3306 dbname: params:map[] loc:%p timeout:0 tls:<nil> allowAllFiles:false allowOldPasswords:false clientFoundRows:false}", time.UTC},
-	{"unix/?arg=%2Fsome%2Fpath.ext", "&{user: passwd: net:unix addr:/tmp/mysql.sock dbname: params:map[arg:/some/path.ext] loc:%p timeout:0 tls:<nil> allowAllFiles:false allowOldPasswords:false clientFoundRows:false}", time.UTC},
-}
-
-func TestDSNParser(t *testing.T) {
-	var cfg *config
-	var err error
-	var res string
-
-	for i, tst := range testDSNs {
-		cfg, err = parseDSN(tst.in)
-		if err != nil {
-			t.Error(err.Error())
-		}
-
-		// pointer not static
-		cfg.tls = nil
-
-		res = fmt.Sprintf("%+v", cfg)
-		if res != fmt.Sprintf(tst.out, tst.loc) {
-			t.Errorf("%d. parseDSN(%q) => %q, want %q", i, tst.in, res, fmt.Sprintf(tst.out, tst.loc))
-		}
-	}
-}
-
-func TestDSNParserInvalid(t *testing.T) {
-	var invalidDSNs = []string{
-		"@net(addr/",  // no closing brace
-		"@tcp(/",      // no closing brace
-		"tcp(/",       // no closing brace
-		"(/",          // no closing brace
-		"net(addr)//", // unescaped
-		//"/dbname?arg=/some/unescaped/path",
-	}
-
-	for i, tst := range invalidDSNs {
-		if _, err := parseDSN(tst); err == nil {
-			t.Errorf("invalid DSN #%d. (%s) didn't error!", i, tst)
-		}
-	}
-}
-
-func BenchmarkParseDSN(b *testing.B) {
-	b.ReportAllocs()
-
-	for i := 0; i < b.N; i++ {
-		for _, tst := range testDSNs {
-			if _, err := parseDSN(tst.in); err != nil {
-				b.Error(err.Error())
-			}
-		}
-	}
-}
-
-func TestScanNullTime(t *testing.T) {
-	var scanTests = []struct {
-		in    interface{}
-		error bool
-		valid bool
-		time  time.Time
+func TestLengthEncodedInteger(t *testing.T) {
+	var integerTests = []struct {
+		num     uint64
+		encoded []byte
 	}{
-		{tDate, false, true, tDate},
-		{sDate, false, true, tDate},
-		{[]byte(sDate), false, true, tDate},
-		{tDateTime, false, true, tDateTime},
-		{sDateTime, false, true, tDateTime},
-		{[]byte(sDateTime), false, true, tDateTime},
-		{tDate0, false, true, tDate0},
-		{sDate0, false, true, tDate0},
-		{[]byte(sDate0), false, true, tDate0},
-		{sDateTime0, false, true, tDate0},
-		{[]byte(sDateTime0), false, true, tDate0},
-		{"", true, false, tDate0},
-		{"1234", true, false, tDate0},
-		{0, true, false, tDate0},
+		{0x0000000000000000, []byte{0x00}},
+		{0x0000000000000012, []byte{0x12}},
+		{0x00000000000000fa, []byte{0xfa}},
+		{0x0000000000000100, []byte{0xfc, 0x00, 0x01}},
+		{0x0000000000001234, []byte{0xfc, 0x34, 0x12}},
+		{0x000000000000ffff, []byte{0xfc, 0xff, 0xff}},
+		{0x0000000000010000, []byte{0xfd, 0x00, 0x00, 0x01}},
+		{0x0000000000123456, []byte{0xfd, 0x56, 0x34, 0x12}},
+		{0x0000000000ffffff, []byte{0xfd, 0xff, 0xff, 0xff}},
+		{0x0000000001000000, []byte{0xfe, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00}},
+		{0x123456789abcdef0, []byte{0xfe, 0xf0, 0xde, 0xbc, 0x9a, 0x78, 0x56, 0x34, 0x12}},
+		{0xffffffffffffffff, []byte{0xfe, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff}},
 	}
 
-	var nt = NullTime{}
-	var err error
+	for _, tst := range integerTests {
+		num, isNull, numLen := readLengthEncodedInteger(tst.encoded)
+		if isNull {
+			t.Errorf("%x: expected %d, got NULL", tst.encoded, tst.num)
+		}
+		if num != tst.num {
+			t.Errorf("%x: expected %d, got %d", tst.encoded, tst.num, num)
+		}
+		if numLen != len(tst.encoded) {
+			t.Errorf("%x: expected size %d, got %d", tst.encoded, len(tst.encoded), numLen)
+		}
+		encoded := appendLengthEncodedInteger(nil, num)
+		if !bytes.Equal(encoded, tst.encoded) {
+			t.Errorf("%v: expected %x, got %x", num, tst.encoded, encoded)
+		}
+	}
+}
 
-	for _, tst := range scanTests {
-		err = nt.Scan(tst.in)
-		if (err != nil) != tst.error {
-			t.Errorf("%v: expected error status %b, got %b", tst.in, tst.error, (err != nil))
+func TestFormatBinaryDateTime(t *testing.T) {
+	rawDate := [11]byte{}
+	binary.LittleEndian.PutUint16(rawDate[:2], 1978)   // years
+	rawDate[2] = 12                                    // months
+	rawDate[3] = 30                                    // days
+	rawDate[4] = 15                                    // hours
+	rawDate[5] = 46                                    // minutes
+	rawDate[6] = 23                                    // seconds
+	binary.LittleEndian.PutUint32(rawDate[7:], 987654) // microseconds
+	expect := func(expected string, inlen, outlen uint8) {
+		actual, _ := formatBinaryDateTime(rawDate[:inlen], outlen)
+		bytes, ok := actual.([]byte)
+		if !ok {
+			t.Errorf("formatBinaryDateTime must return []byte, was %T", actual)
 		}
-		if nt.Valid != tst.valid {
-			t.Errorf("%v: expected valid status %b, got %b", tst.in, tst.valid, nt.Valid)
+		if string(bytes) != expected {
+			t.Errorf(
+				"expected %q, got %q for length in %d, out %d",
+				expected, actual, inlen, outlen,
+			)
 		}
-		if nt.Time != tst.time {
-			t.Errorf("%v: expected time %v, got %v", tst.in, tst.time, nt.Time)
+	}
+	expect("0000-00-00", 0, 10)
+	expect("0000-00-00 00:00:00", 0, 19)
+	expect("1978-12-30", 4, 10)
+	expect("1978-12-30 15:46:23", 7, 19)
+	expect("1978-12-30 15:46:23.987654", 11, 26)
+}
+
+func TestFormatBinaryTime(t *testing.T) {
+	expect := func(expected string, src []byte, outlen uint8) {
+		actual, _ := formatBinaryTime(src, outlen)
+		bytes, ok := actual.([]byte)
+		if !ok {
+			t.Errorf("formatBinaryDateTime must return []byte, was %T", actual)
 		}
+		if string(bytes) != expected {
+			t.Errorf(
+				"expected %q, got %q for src=%q and outlen=%d",
+				expected, actual, src, outlen)
+		}
+	}
+
+	// binary format:
+	// sign (0: positive, 1: negative), days(4), hours, minutes, seconds, micro(4)
+
+	// Zeros
+	expect("00:00:00", []byte{}, 8)
+	expect("00:00:00.0", []byte{}, 10)
+	expect("00:00:00.000000", []byte{}, 15)
+
+	// Without micro(4)
+	expect("12:34:56", []byte{0, 0, 0, 0, 0, 12, 34, 56}, 8)
+	expect("-12:34:56", []byte{1, 0, 0, 0, 0, 12, 34, 56}, 8)
+	expect("12:34:56.00", []byte{0, 0, 0, 0, 0, 12, 34, 56}, 11)
+	expect("24:34:56", []byte{0, 1, 0, 0, 0, 0, 34, 56}, 8)
+	expect("-99:34:56", []byte{1, 4, 0, 0, 0, 3, 34, 56}, 8)
+	expect("103079215103:34:56", []byte{0, 255, 255, 255, 255, 23, 34, 56}, 8)
+
+	// With micro(4)
+	expect("12:34:56.00", []byte{0, 0, 0, 0, 0, 12, 34, 56, 99, 0, 0, 0}, 11)
+	expect("12:34:56.000099", []byte{0, 0, 0, 0, 0, 12, 34, 56, 99, 0, 0, 0}, 15)
+}
+
+func TestEscapeBackslash(t *testing.T) {
+	expect := func(expected, value string) {
+		actual := string(escapeBytesBackslash([]byte{}, []byte(value)))
+		if actual != expected {
+			t.Errorf(
+				"expected %s, got %s",
+				expected, actual,
+			)
+		}
+
+		actual = string(escapeStringBackslash([]byte{}, value))
+		if actual != expected {
+			t.Errorf(
+				"expected %s, got %s",
+				expected, actual,
+			)
+		}
+	}
+
+	expect("foo\\0bar", "foo\x00bar")
+	expect("foo\\nbar", "foo\nbar")
+	expect("foo\\rbar", "foo\rbar")
+	expect("foo\\Zbar", "foo\x1abar")
+	expect("foo\\\"bar", "foo\"bar")
+	expect("foo\\\\bar", "foo\\bar")
+	expect("foo\\'bar", "foo'bar")
+}
+
+func TestEscapeQuotes(t *testing.T) {
+	expect := func(expected, value string) {
+		actual := string(escapeBytesQuotes([]byte{}, []byte(value)))
+		if actual != expected {
+			t.Errorf(
+				"expected %s, got %s",
+				expected, actual,
+			)
+		}
+
+		actual = string(escapeStringQuotes([]byte{}, value))
+		if actual != expected {
+			t.Errorf(
+				"expected %s, got %s",
+				expected, actual,
+			)
+		}
+	}
+
+	expect("foo\x00bar", "foo\x00bar") // not affected
+	expect("foo\nbar", "foo\nbar")     // not affected
+	expect("foo\rbar", "foo\rbar")     // not affected
+	expect("foo\x1abar", "foo\x1abar") // not affected
+	expect("foo''bar", "foo'bar")      // affected
+	expect("foo\"bar", "foo\"bar")     // not affected
+}
+
+func TestAtomicBool(t *testing.T) {
+	var ab atomicBool
+	if ab.IsSet() {
+		t.Fatal("Expected value to be false")
+	}
+
+	ab.Set(true)
+	if ab.value != 1 {
+		t.Fatal("Set(true) did not set value to 1")
+	}
+	if !ab.IsSet() {
+		t.Fatal("Expected value to be true")
+	}
+
+	ab.Set(true)
+	if !ab.IsSet() {
+		t.Fatal("Expected value to be true")
+	}
+
+	ab.Set(false)
+	if ab.value != 0 {
+		t.Fatal("Set(false) did not set value to 0")
+	}
+	if ab.IsSet() {
+		t.Fatal("Expected value to be false")
+	}
+
+	ab.Set(false)
+	if ab.IsSet() {
+		t.Fatal("Expected value to be false")
+	}
+	if ab.TrySet(false) {
+		t.Fatal("Expected TrySet(false) to fail")
+	}
+	if !ab.TrySet(true) {
+		t.Fatal("Expected TrySet(true) to succeed")
+	}
+	if !ab.IsSet() {
+		t.Fatal("Expected value to be true")
+	}
+
+	ab.Set(true)
+	if !ab.IsSet() {
+		t.Fatal("Expected value to be true")
+	}
+	if ab.TrySet(true) {
+		t.Fatal("Expected TrySet(true) to fail")
+	}
+	if !ab.TrySet(false) {
+		t.Fatal("Expected TrySet(false) to succeed")
+	}
+	if ab.IsSet() {
+		t.Fatal("Expected value to be false")
+	}
+
+	// we've "tested" them ¯\_(ツ)_/¯
+	ab._noCopy.Lock()
+	defer ab._noCopy.Unlock()
+}
+
+func TestAtomicError(t *testing.T) {
+	var ae atomicError
+	if ae.Value() != nil {
+		t.Fatal("Expected value to be nil")
+	}
+
+	ae.Set(ErrMalformPkt)
+	if v := ae.Value(); v != ErrMalformPkt {
+		if v == nil {
+			t.Fatal("Value is still nil")
+		}
+		t.Fatal("Error did not match")
+	}
+	ae.Set(ErrPktSync)
+	if ae.Value() == ErrMalformPkt {
+		t.Fatal("Error still matches old error")
+	}
+	if v := ae.Value(); v != ErrPktSync {
+		t.Fatal("Error did not match")
+	}
+}
+
+func TestIsolationLevelMapping(t *testing.T) {
+	data := []struct {
+		level    driver.IsolationLevel
+		expected string
+	}{
+		{
+			level:    driver.IsolationLevel(sql.LevelReadCommitted),
+			expected: "READ COMMITTED",
+		},
+		{
+			level:    driver.IsolationLevel(sql.LevelRepeatableRead),
+			expected: "REPEATABLE READ",
+		},
+		{
+			level:    driver.IsolationLevel(sql.LevelReadUncommitted),
+			expected: "READ UNCOMMITTED",
+		},
+		{
+			level:    driver.IsolationLevel(sql.LevelSerializable),
+			expected: "SERIALIZABLE",
+		},
+	}
+
+	for i, td := range data {
+		if actual, err := mapIsolationLevel(td.level); actual != td.expected || err != nil {
+			t.Fatal(i, td.expected, actual, err)
+		}
+	}
+
+	// check unsupported mapping
+	expectedErr := "mysql: unsupported isolation level: 7"
+	actual, err := mapIsolationLevel(driver.IsolationLevel(sql.LevelLinearizable))
+	if actual != "" || err == nil {
+		t.Fatal("Expected error on unsupported isolation level")
+	}
+	if err.Error() != expectedErr {
+		t.Fatalf("Expected error to be %q, got %q", expectedErr, err)
+	}
+}
+
+func TestAppendDateTime(t *testing.T) {
+	tests := []struct {
+		t   time.Time
+		str string
+	}{
+		{
+			t:   time.Date(1234, 5, 6, 0, 0, 0, 0, time.UTC),
+			str: "1234-05-06",
+		},
+		{
+			t:   time.Date(4567, 12, 31, 12, 0, 0, 0, time.UTC),
+			str: "4567-12-31 12:00:00",
+		},
+		{
+			t:   time.Date(2020, 5, 30, 12, 34, 0, 0, time.UTC),
+			str: "2020-05-30 12:34:00",
+		},
+		{
+			t:   time.Date(2020, 5, 30, 12, 34, 56, 0, time.UTC),
+			str: "2020-05-30 12:34:56",
+		},
+		{
+			t:   time.Date(2020, 5, 30, 22, 33, 44, 123000000, time.UTC),
+			str: "2020-05-30 22:33:44.123",
+		},
+		{
+			t:   time.Date(2020, 5, 30, 22, 33, 44, 123456000, time.UTC),
+			str: "2020-05-30 22:33:44.123456",
+		},
+		{
+			t:   time.Date(2020, 5, 30, 22, 33, 44, 123456789, time.UTC),
+			str: "2020-05-30 22:33:44.123456789",
+		},
+		{
+			t:   time.Date(9999, 12, 31, 23, 59, 59, 999999999, time.UTC),
+			str: "9999-12-31 23:59:59.999999999",
+		},
+		{
+			t:   time.Date(1, 1, 1, 0, 0, 0, 0, time.UTC),
+			str: "0001-01-01",
+		},
+	}
+	for _, v := range tests {
+		buf := make([]byte, 0, 32)
+		buf, _ = appendDateTime(buf, v.t)
+		if str := string(buf); str != v.str {
+			t.Errorf("appendDateTime(%v), have: %s, want: %s", v.t, str, v.str)
+		}
+	}
+
+	// year out of range
+	{
+		v := time.Date(0, 1, 1, 0, 0, 0, 0, time.UTC)
+		buf := make([]byte, 0, 32)
+		_, err := appendDateTime(buf, v)
+		if err == nil {
+			t.Error("want an error")
+			return
+		}
+	}
+	{
+		v := time.Date(10000, 1, 1, 0, 0, 0, 0, time.UTC)
+		buf := make([]byte, 0, 32)
+		_, err := appendDateTime(buf, v)
+		if err == nil {
+			t.Error("want an error")
+			return
+		}
+	}
+}
+
+func TestParseDateTime(t *testing.T) {
+	cases := []struct {
+		name string
+		str  string
+	}{
+		{
+			name: "parse date",
+			str:  "2020-05-13",
+		},
+		{
+			name: "parse null date",
+			str:  sDate0,
+		},
+		{
+			name: "parse datetime",
+			str:  "2020-05-13 21:30:45",
+		},
+		{
+			name: "parse null datetime",
+			str:  sDateTime0,
+		},
+		{
+			name: "parse datetime nanosec 1-digit",
+			str:  "2020-05-25 23:22:01.1",
+		},
+		{
+			name: "parse datetime nanosec 2-digits",
+			str:  "2020-05-25 23:22:01.15",
+		},
+		{
+			name: "parse datetime nanosec 3-digits",
+			str:  "2020-05-25 23:22:01.159",
+		},
+		{
+			name: "parse datetime nanosec 4-digits",
+			str:  "2020-05-25 23:22:01.1594",
+		},
+		{
+			name: "parse datetime nanosec 5-digits",
+			str:  "2020-05-25 23:22:01.15949",
+		},
+		{
+			name: "parse datetime nanosec 6-digits",
+			str:  "2020-05-25 23:22:01.159491",
+		},
+	}
+
+	for _, loc := range []*time.Location{
+		time.UTC,
+		time.FixedZone("test", 8*60*60),
+	} {
+		for _, cc := range cases {
+			t.Run(cc.name+"-"+loc.String(), func(t *testing.T) {
+				var want time.Time
+				if cc.str != sDate0 && cc.str != sDateTime0 {
+					var err error
+					want, err = time.ParseInLocation(timeFormat[:len(cc.str)], cc.str, loc)
+					if err != nil {
+						t.Fatal(err)
+					}
+				}
+				got, err := parseDateTime([]byte(cc.str), loc)
+				if err != nil {
+					t.Fatal(err)
+				}
+
+				if !want.Equal(got) {
+					t.Fatalf("want: %v, but got %v", want, got)
+				}
+			})
+		}
+	}
+}
+
+func TestParseDateTimeFail(t *testing.T) {
+	cases := []struct {
+		name    string
+		str     string
+		wantErr string
+	}{
+		{
+			name:    "parse invalid time",
+			str:     "hello",
+			wantErr: "invalid time bytes: hello",
+		},
+		{
+			name:    "parse year",
+			str:     "000!-00-00 00:00:00.000000",
+			wantErr: "not [0-9]",
+		},
+		{
+			name:    "parse month",
+			str:     "0000-!0-00 00:00:00.000000",
+			wantErr: "not [0-9]",
+		},
+		{
+			name:    `parse "-" after parsed year`,
+			str:     "0000:00-00 00:00:00.000000",
+			wantErr: "bad value for field: `:`",
+		},
+		{
+			name:    `parse "-" after parsed month`,
+			str:     "0000-00:00 00:00:00.000000",
+			wantErr: "bad value for field: `:`",
+		},
+		{
+			name:    `parse " " after parsed date`,
+			str:     "0000-00-00+00:00:00.000000",
+			wantErr: "bad value for field: `+`",
+		},
+		{
+			name:    `parse ":" after parsed date`,
+			str:     "0000-00-00 00-00:00.000000",
+			wantErr: "bad value for field: `-`",
+		},
+		{
+			name:    `parse ":" after parsed hour`,
+			str:     "0000-00-00 00:00-00.000000",
+			wantErr: "bad value for field: `-`",
+		},
+		{
+			name:    `parse "." after parsed sec`,
+			str:     "0000-00-00 00:00:00?000000",
+			wantErr: "bad value for field: `?`",
+		},
+	}
+
+	for _, cc := range cases {
+		t.Run(cc.name, func(t *testing.T) {
+			got, err := parseDateTime([]byte(cc.str), time.UTC)
+			if err == nil {
+				t.Fatal("want error")
+			}
+			if cc.wantErr != err.Error() {
+				t.Fatalf("want `%s`, but got `%s`", cc.wantErr, err)
+			}
+			if !got.IsZero() {
+				t.Fatal("want zero time")
+			}
+		})
 	}
 }
